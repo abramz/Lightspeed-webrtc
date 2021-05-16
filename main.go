@@ -3,22 +3,43 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/GRVYDEV/lightspeed-webrtc/ws"
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/websocket"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
+
+	"github.com/microsoft/iron-go"
 )
+
+type Session struct {
+	Issuer string `json:"issuer"`
+	PublicAddress string `json:"publicAddress"`
+	Email string `json:"email"`
+	CreatedAt float64 `json:"createdAt"`
+	MaxAge float64 `json:"maxAge"`
+}
+func (s *Session) GetCreatedAt() float64 {
+	return s.CreatedAt
+}
+func (s *Session) GetMaxAge() float64 {
+	return s.MaxAge
+}
 
 var (
 	addr     = flag.String("addr", "localhost", "http service address")
@@ -37,6 +58,9 @@ var (
 	audioTrack *webrtc.TrackLocalStaticRTP
 
 	hub *ws.Hub
+
+	allowedOrigins = os.Getenv("CORS_ALLOWED_ORIGINS")
+	tokenSecret = os.Getenv("TOKEN_SECRET")
 )
 
 func main() {
@@ -73,13 +97,27 @@ func main() {
 
 	// start HTTP server
 	go func() {
-		http.HandleFunc("/websocket", websocketHandler)
+		router := http.NewServeMux()
+
+		router.HandleFunc("/websocket", websocketHandler)
+
+		if (len(allowedOrigins) == 0) {
+			allowedOrigins = "*"
+		}
+
+		var (
+			corsAllowedHeaders = handlers.AllowedHeaders([]string{"X-Requested-With", "Content-Type", "Authorization"})
+			corsAllowedMethods = handlers.AllowedMethods([]string{"GET", "POST", "PUT", "HEAD", "OPTIONS"})
+			corsAllowedOrigins = handlers.AllowedOrigins([]string{allowedOrigins})
+			corsAllowCredentials = handlers.AllowCredentials()
+		)
+		corsHandler := handlers.CORS(corsAllowedHeaders, corsAllowedMethods, corsAllowedOrigins, corsAllowCredentials)
 
 		wsAddr := *addr+":"+strconv.Itoa(*wsPort)
 		if *sslCert != "" && *sslKey != "" {
-			log.Fatal(http.ListenAndServeTLS(wsAddr, *sslCert, *sslKey, nil))
+			log.Fatal(http.ListenAndServeTLS(wsAddr, *sslCert, *sslKey, corsHandler(router)))
 		} else {
-			log.Fatal(http.ListenAndServe(wsAddr, nil))
+			log.Fatal(http.ListenAndServe(wsAddr, corsHandler(router)))
 		}
 	}()
 
@@ -100,7 +138,6 @@ func main() {
 			//It has been found that the windows version of OBS sends us some malformed packets
 			//It does not effect the stream so we will disable any output here
 			//fmt.Printf("Error unmarshaling RTP packet %s\n", err)
-
 		}
 
 		if packet.Header.PayloadType == 96 {
@@ -157,6 +194,12 @@ func createWebrtcApi() *webrtc.API {
 
 // Handle incoming websockets
 func websocketHandler(w http.ResponseWriter, r *http.Request) {
+	success, err := checkAuthCookie(r)
+	if (!success) {
+		log.Print("Failed to validate the authentication cookie: ", err)
+		
+		return
+	}
 
 	// Upgrade HTTP request to Websocket
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -187,6 +230,11 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 			Direction: webrtc.RTPTransceiverDirectionSendonly,
 		},
 	)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
 	transceiverAudio, err := peerConnection.AddTransceiverFromTrack(audioTrack,
 		webrtc.RTPTransceiverInit{
 			Direction: webrtc.RTPTransceiverDirectionSendonly,
@@ -283,4 +331,35 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c.ReadLoop()
+}
+
+func checkAuthCookie(r *http.Request) (success bool, err error) {
+	nowS := time.Now().Unix()
+	unsealer := iron.New(iron.Options{Secret: []byte(tokenSecret)})
+	
+	sealedToken, err := r.Cookie("token")
+
+	if (err != nil) {
+		return false, err
+	}
+
+	unsealedToken, err := unsealer.Unseal(sealedToken.Value)
+	if (err != nil) {
+		return false, err
+	}
+	// for some reason so control characters are being added after the '}'
+	token := bytes.Trim(unsealedToken, "\x06")
+
+	var session Session
+	err = json.Unmarshal(token, &session)
+	if (err != nil) {
+		return false, err
+	}
+
+	expiresAt := session.GetCreatedAt() + session.GetMaxAge()
+	if (float64(nowS) > expiresAt) {
+		return false, errors.New("Session has expired")
+	}
+
+	return true, nil
 }
