@@ -11,13 +11,11 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/GRVYDEV/lightspeed-webrtc/ws"
-	"github.com/gorilla/handlers"
 	"github.com/gorilla/websocket"
 
 	"github.com/pion/interceptor"
@@ -42,16 +40,16 @@ func (s *Session) GetMaxAge() float64 {
 }
 
 var (
-	addr     = flag.String("addr", "localhost", "http service address")
-	ip       = flag.String("ip", "none", "IP address for webrtc")
-	wsPort   = flag.Int("ws-port", 8080, "Port for websocket")
-	rtpPort  = flag.Int("rtp-port", 65535, "Port for RTP")
-	ports    = flag.String("ports", "20000-20500", "Port range for webrtc")
-	sslCert  = flag.String("ssl-cert", "", "Ssl cert for websocket (optional)")
-	sslKey   = flag.String("ssl-key", "", "Ssl key for websocket (optional)")
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
+	addr           = flag.String("addr", "localhost", "http service address")
+	ip             = flag.String("ip", "none", "IP address for webrtc")
+	wsPort         = flag.Int("ws-port", 8080, "Port for websocket")
+	rtpPort        = flag.Int("rtp-port", 65535, "Port for RTP")
+	ports          = flag.String("ports", "20000-20500", "Port range for webrtc")
+	sslCert        = flag.String("ssl-cert", "", "Ssl cert for websocket (optional)")
+	sslKey         = flag.String("ssl-key", "", "Ssl key for websocket (optional)")
+	tokenSecret    = flag.String("token-secret", "", "Secret for cookie auth (optional)")
+	allowedOrigin  = flag.String("origin", "*", "Allowed origin(s), can be empty or * to allow all origins, or a comma-separated list of origins (optional)")
+	strictOrigin   = flag.Bool("strict-origin", false, "Whether or not to use strict origin checking (forbids empty origin header) (optional)")
 
 	videoTrack *webrtc.TrackLocalStaticRTP
 
@@ -59,8 +57,38 @@ var (
 
 	hub *ws.Hub
 
-	allowedOrigins = os.Getenv("CORS_ALLOWED_ORIGINS")
-	tokenSecret = os.Getenv("TOKEN_SECRET")
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { 
+			if (allowedOrigin == nil || *allowedOrigin == "" || *allowedOrigin == "*") {
+				log.Print("Allowing all origins")
+
+				return true
+			}
+
+			origin := r.Header.Get("Origin")
+			if (origin == "") {
+				isStrict := strictOrigin != nil && *strictOrigin
+				log.Print("Origin not provided, strict? ", isStrict)
+
+				return !isStrict
+			}
+
+			allowedOrigins := strings.Split(*allowedOrigin, ",")
+			
+
+			for _, v := range allowedOrigins {
+				if origin == v {
+					log.Print("Requset from allowed origin, ", v)
+
+					return true
+				}
+			}
+
+			log.Print("Request not from allowed origin, ", origin)
+
+			return false
+		},
+	}
 )
 
 func main() {
@@ -97,27 +125,13 @@ func main() {
 
 	// start HTTP server
 	go func() {
-		router := http.NewServeMux()
-
-		router.HandleFunc("/websocket", websocketHandler)
-
-		if (len(allowedOrigins) == 0) {
-			allowedOrigins = "*"
-		}
-
-		var (
-			corsAllowedHeaders = handlers.AllowedHeaders([]string{"X-Requested-With", "Content-Type", "Authorization"})
-			corsAllowedMethods = handlers.AllowedMethods([]string{"GET", "POST", "PUT", "HEAD", "OPTIONS"})
-			corsAllowedOrigins = handlers.AllowedOrigins([]string{allowedOrigins})
-			corsAllowCredentials = handlers.AllowCredentials()
-		)
-		corsHandler := handlers.CORS(corsAllowedHeaders, corsAllowedMethods, corsAllowedOrigins, corsAllowCredentials)
+		http.HandleFunc("/websocket", websocketHandler)
 
 		wsAddr := *addr+":"+strconv.Itoa(*wsPort)
 		if *sslCert != "" && *sslKey != "" {
-			log.Fatal(http.ListenAndServeTLS(wsAddr, *sslCert, *sslKey, corsHandler(router)))
+			log.Fatal(http.ListenAndServeTLS(wsAddr, *sslCert, *sslKey, nil))
 		} else {
-			log.Fatal(http.ListenAndServe(wsAddr, corsHandler(router)))
+			log.Fatal(http.ListenAndServe(wsAddr, nil))
 		}
 	}()
 
@@ -199,6 +213,12 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 		log.Print("Failed to validate the authentication cookie: ", err)
 		
 		return
+	}
+
+	if (upgrader.CheckOrigin(r)) {
+		log.Print("Yay")
+	} else {
+		log.Print("boo")
 	}
 
 	// Upgrade HTTP request to Websocket
@@ -335,7 +355,21 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 
 func checkAuthCookie(r *http.Request) (success bool, err error) {
 	nowS := time.Now().Unix()
-	unsealer := iron.New(iron.Options{Secret: []byte(tokenSecret)})
+	
+	var secret string
+	if (tokenSecret == nil) {
+		log.Print("No secret provided, skipping auth cookie check")
+
+		return true, nil
+	}
+	secret = *tokenSecret
+	if (secret == "") {
+		log.Print("Secret empty, skipping auth cookie check")
+
+		return true, nil
+	}
+	
+	unsealer := iron.New(iron.Options{Secret: []byte(secret)})
 	
 	sealedToken, err := r.Cookie("token")
 
@@ -347,7 +381,7 @@ func checkAuthCookie(r *http.Request) (success bool, err error) {
 	if (err != nil) {
 		return false, err
 	}
-	// for some reason so control characters are being added after the '}'
+	// for some reason there are control characters being added after the "}", maybe the golang iron isn't stripping the padding the JS iron adds, idk if it adds padding?
 	token := bytes.Trim(unsealedToken, "\x06")
 
 	var session Session
