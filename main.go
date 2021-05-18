@@ -215,12 +215,6 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if (upgrader.CheckOrigin(r)) {
-		log.Print("Yay")
-	} else {
-		log.Print("boo")
-	}
-
 	// Upgrade HTTP request to Websocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
